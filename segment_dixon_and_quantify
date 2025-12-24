@@ -1,0 +1,525 @@
+import argparse
+import os
+import subprocess
+from typing import Dict, Tuple
+
+import numpy as np
+import SimpleITK as sitk
+
+try:
+    # TPTBox provides vertebra naming utilities
+    from TPTBox import v_name2idx  # type: ignore
+except Exception:
+    v_name2idx = None
+
+
+def run_vibe_segmentator(img_path: str, out_seg_path: str, device: str, dataset_id: int, project_root: str) -> None:
+    """Run VIBESegmentator on a single image."""
+    script_path = os.path.join(project_root, "run_VIBESegmentator.py")
+    cmd = [
+        "python",
+        script_path,
+        "--img",
+        img_path,
+        "--out_path",
+        out_seg_path,
+        "--dataset_id",
+        str(dataset_id),
+        "--ddevice",
+        device,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def run_vibe_segmentator_multi(
+    img_water: str, img_fat: str | None, out_seg_path: str, device: str, project_root: str
+) -> None:
+    """Run VIBESegmentator with water (and optionally fat) images."""
+    script_path = os.path.join(project_root, "run_VIBEVibeSegmentator_multi.py")
+    cmd = [
+        "python",
+        script_path,
+        "--img_water",
+        img_water,
+        "--out_path",
+        out_seg_path,
+        "--ddevice",
+        device,
+    ]
+    if img_fat is not None:
+        # Note: run_VIBEVibeSegmentator_multi expects inphase/outphase, not fat directly
+        # For now, we'll use water image for segmentation
+        pass
+    subprocess.run(cmd, check=True)
+
+
+def compute_muscle_volumes_and_fat_fraction(
+    seg_path: str, water_path: str, fat_path: str
+) -> Tuple[Dict[int, Dict], Dict[int, Dict]]:
+    """
+    Compute volumes and fat fraction for each individual muscle.
+    
+    Returns:
+        volumes_dict: Dictionary with volume metrics per muscle
+        fat_fraction_dict: Dictionary with fat fraction metrics per muscle
+    """
+    # Load images
+    seg_img = sitk.ReadImage(seg_path)
+    water_img = sitk.ReadImage(water_path)
+    fat_img = sitk.ReadImage(fat_path)
+    
+    # Get spacing and compute voxel volume
+    spacing = seg_img.GetSpacing()  # (x, y, z) mm
+    voxel_volume_mm3 = float(spacing[0] * spacing[1] * spacing[2])
+    
+    # Convert to arrays
+    seg_arr = sitk.GetArrayFromImage(seg_img).astype(np.int32)  # z, y, x
+    water_arr = sitk.GetArrayFromImage(water_img).astype(np.float32)
+    fat_arr = sitk.GetArrayFromImage(fat_img).astype(np.float32)
+    
+    # Ensure arrays are aligned (resample if needed)
+    if seg_arr.shape != water_arr.shape:
+        print(f"  Resampling water/fat to match segmentation: {water_arr.shape} -> {seg_arr.shape}")
+        water_img_resampled = sitk.Resample(water_img, seg_img, sitk.Transform(), sitk.sitkLinear)
+        fat_img_resampled = sitk.Resample(fat_img, seg_img, sitk.Transform(), sitk.sitkLinear)
+        water_arr = sitk.GetArrayFromImage(water_img_resampled).astype(np.float32)
+        fat_arr = sitk.GetArrayFromImage(fat_img_resampled).astype(np.float32)
+    
+    # Final check: ensure shapes match exactly
+    if seg_arr.shape != water_arr.shape or seg_arr.shape != fat_arr.shape:
+        print(f"  WARNING: Shape mismatch after resampling!")
+        print(f"    Segmentation: {seg_arr.shape}")
+        print(f"    Water: {water_arr.shape}")
+        print(f"    Fat: {fat_arr.shape}")
+        print(f"  Trimming to minimum dimensions...")
+        min_shape = (
+            min(seg_arr.shape[0], water_arr.shape[0], fat_arr.shape[0]),
+            min(seg_arr.shape[1], water_arr.shape[1], fat_arr.shape[1]),
+            min(seg_arr.shape[2], water_arr.shape[2], fat_arr.shape[2])
+        )
+        seg_arr = seg_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        water_arr = water_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        fat_arr = fat_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        print(f"  Trimmed to: {seg_arr.shape}")
+    
+    # Individual muscle labels
+    muscle_labels = {
+        53: "gluteus_maximus_left",
+        54: "gluteus_maximus_right",
+        55: "gluteus_medius_left",
+        56: "gluteus_medius_right",
+        57: "gluteus_minimus_left",
+        58: "gluteus_minimus_right",
+        59: "autochthon_left",
+        60: "autochthon_right",
+        61: "iliopsoas_left",
+        62: "iliopsoas_right",
+        66: "muscle_other",  # All other muscles
+    }
+    
+    volumes_dict: Dict[int, Dict] = {}
+    fat_fraction_dict: Dict[int, Dict] = {}
+    
+    for label_id, muscle_name in muscle_labels.items():
+        # Create mask for this muscle
+        muscle_mask = (seg_arr == label_id)
+        num_voxels = int(muscle_mask.sum())
+        
+        if num_voxels == 0:
+            continue
+        
+        # Compute volume
+        volume_mm3 = num_voxels * voxel_volume_mm3
+        volume_ml = volume_mm3 / 1000.0
+        
+        volumes_dict[label_id] = {
+            "label_id": label_id,
+            "label_name": muscle_name,
+            "voxel_count": num_voxels,
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volume_mm3,
+            "volume_ml": volume_ml,
+        }
+        
+        # Compute fat fraction within muscle mask
+        water_values = water_arr[muscle_mask]
+        fat_values = fat_arr[muscle_mask]
+        
+        # Avoid division by zero: fat_fraction = fat / (water + fat) * 100
+        total_signal = water_values + fat_values
+        valid_mask = total_signal > 0
+        fat_fraction_values = np.zeros_like(fat_values)
+        fat_fraction_values[valid_mask] = (fat_values[valid_mask] / total_signal[valid_mask]) * 100.0
+        
+        # Compute statistics
+        mean_ff = float(np.mean(fat_fraction_values))
+        median_ff = float(np.median(fat_fraction_values))
+        std_ff = float(np.std(fat_fraction_values))
+        p10_ff = float(np.percentile(fat_fraction_values, 10))
+        p90_ff = float(np.percentile(fat_fraction_values, 90))
+        
+        fat_fraction_dict[label_id] = {
+            "label_id": label_id,
+            "label_name": muscle_name,
+            "num_voxels": num_voxels,
+            "mean_ff_%": mean_ff,
+            "median_ff_%": median_ff,
+            "std_ff_%": std_ff,
+            "p10_ff_%": p10_ff,
+            "p90_ff_%": p90_ff,
+        }
+    
+    # Add combined totals
+    # Gluteus maximus total
+    if 53 in volumes_dict and 54 in volumes_dict:
+        volumes_dict[1001] = {
+            "label_id": "53+54",
+            "label_name": "gluteus_maximus_total",
+            "voxel_count": volumes_dict[53]["voxel_count"] + volumes_dict[54]["voxel_count"],
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volumes_dict[53]["volume_mm3"] + volumes_dict[54]["volume_mm3"],
+            "volume_ml": volumes_dict[53]["volume_ml"] + volumes_dict[54]["volume_ml"],
+        }
+    
+    # Gluteus medius total
+    if 55 in volumes_dict and 56 in volumes_dict:
+        volumes_dict[1002] = {
+            "label_id": "55+56",
+            "label_name": "gluteus_medius_total",
+            "voxel_count": volumes_dict[55]["voxel_count"] + volumes_dict[56]["voxel_count"],
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volumes_dict[55]["volume_mm3"] + volumes_dict[56]["volume_mm3"],
+            "volume_ml": volumes_dict[55]["volume_ml"] + volumes_dict[56]["volume_ml"],
+        }
+    
+    # Gluteus minimus total
+    if 57 in volumes_dict and 58 in volumes_dict:
+        volumes_dict[1003] = {
+            "label_id": "57+58",
+            "label_name": "gluteus_minimus_total",
+            "voxel_count": volumes_dict[57]["voxel_count"] + volumes_dict[58]["voxel_count"],
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volumes_dict[57]["volume_mm3"] + volumes_dict[58]["volume_mm3"],
+            "volume_ml": volumes_dict[57]["volume_ml"] + volumes_dict[58]["volume_ml"],
+        }
+    
+    # Autochthon total
+    if 59 in volumes_dict and 60 in volumes_dict:
+        volumes_dict[1004] = {
+            "label_id": "59+60",
+            "label_name": "autochthon_total",
+            "voxel_count": volumes_dict[59]["voxel_count"] + volumes_dict[60]["voxel_count"],
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volumes_dict[59]["volume_mm3"] + volumes_dict[60]["volume_mm3"],
+            "volume_ml": volumes_dict[59]["volume_ml"] + volumes_dict[60]["volume_ml"],
+        }
+    
+    # Iliopsoas total
+    if 61 in volumes_dict and 62 in volumes_dict:
+        volumes_dict[1005] = {
+            "label_id": "61+62",
+            "label_name": "iliopsoas_total",
+            "voxel_count": volumes_dict[61]["voxel_count"] + volumes_dict[62]["voxel_count"],
+            "voxel_volume_mm3": voxel_volume_mm3,
+            "volume_mm3": volumes_dict[61]["volume_mm3"] + volumes_dict[62]["volume_mm3"],
+            "volume_ml": volumes_dict[61]["volume_ml"] + volumes_dict[62]["volume_ml"],
+        }
+    
+    # All muscles total
+    all_muscle_labels = [53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 66]
+    total_voxels = sum(volumes_dict[k]["voxel_count"] for k in all_muscle_labels if k in volumes_dict)
+    total_volume_ml = sum(volumes_dict[k]["volume_ml"] for k in all_muscle_labels if k in volumes_dict)
+    volumes_dict[2000] = {
+        "label_id": "all_muscles",
+        "label_name": "all_muscles_included_set",
+        "voxel_count": total_voxels,
+        "voxel_volume_mm3": voxel_volume_mm3,
+        "volume_mm3": total_volume_ml * 1000.0,
+        "volume_ml": total_volume_ml,
+    }
+    
+    return volumes_dict, fat_fraction_dict
+
+
+def compute_fat_metrics(seg_path: str, water_path: str, fat_path: str) -> Dict[str, Dict]:
+    """
+    Compute detailed SAT, VAT, and inner fat metrics.
+    
+    Returns:
+        Dictionary with detailed fat metrics
+    """
+    # Load images
+    seg_img = sitk.ReadImage(seg_path)
+    water_img = sitk.ReadImage(water_path)
+    fat_img = sitk.ReadImage(fat_path)
+    
+    # Get spacing
+    spacing = seg_img.GetSpacing()
+    voxel_volume_mm3 = float(spacing[0] * spacing[1] * spacing[2])
+    
+    # Convert to arrays
+    seg_arr = sitk.GetArrayFromImage(seg_img).astype(np.int32)
+    water_arr = sitk.GetArrayFromImage(water_img).astype(np.float32)
+    fat_arr = sitk.GetArrayFromImage(fat_img).astype(np.float32)
+    
+    # Ensure arrays are aligned
+    if seg_arr.shape != water_arr.shape:
+        print(f"  Resampling water/fat to match segmentation: {water_arr.shape} -> {seg_arr.shape}")
+        water_img_resampled = sitk.Resample(water_img, seg_img, sitk.Transform(), sitk.sitkLinear)
+        fat_img_resampled = sitk.Resample(fat_img, seg_img, sitk.Transform(), sitk.sitkLinear)
+        water_arr = sitk.GetArrayFromImage(water_img_resampled).astype(np.float32)
+        fat_arr = sitk.GetArrayFromImage(fat_img_resampled).astype(np.float32)
+    
+    # Final check: ensure shapes match exactly
+    if seg_arr.shape != water_arr.shape or seg_arr.shape != fat_arr.shape:
+        print(f"  WARNING: Shape mismatch after resampling!")
+        print(f"    Segmentation: {seg_arr.shape}")
+        print(f"    Water: {water_arr.shape}")
+        print(f"    Fat: {fat_arr.shape}")
+        print(f"  Trimming to minimum dimensions...")
+        min_shape = (
+            min(seg_arr.shape[0], water_arr.shape[0], fat_arr.shape[0]),
+            min(seg_arr.shape[1], water_arr.shape[1], fat_arr.shape[1]),
+            min(seg_arr.shape[2], water_arr.shape[2], fat_arr.shape[2])
+        )
+        seg_arr = seg_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        water_arr = water_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        fat_arr = fat_arr[:min_shape[0], :min_shape[1], :min_shape[2]]
+        print(f"  Trimmed to: {seg_arr.shape}")
+    
+    fat_metrics = {}
+    
+    # SAT (Subcutaneous Adipose Tissue) - label 65
+    sat_mask = (seg_arr == 65)
+    sat_voxels = int(sat_mask.sum())
+    sat_volume_ml = (sat_voxels * voxel_volume_mm3) / 1000.0
+    
+    if sat_voxels > 0:
+        sat_water = water_arr[sat_mask]
+        sat_fat = fat_arr[sat_mask]
+        sat_total = sat_water + sat_fat
+        sat_valid = sat_total > 0
+        sat_ff = np.zeros_like(sat_fat)
+        sat_ff[sat_valid] = (sat_fat[sat_valid] / sat_total[sat_valid]) * 100.0
+        
+        fat_metrics["SAT"] = {
+            "label_id": 65,
+            "label_name": "subcutaneous_fat",
+            "voxel_count": sat_voxels,
+            "volume_mm3": sat_volume_ml * 1000.0,
+            "volume_ml": sat_volume_ml,
+            "mean_fat_fraction_%": float(np.mean(sat_ff)),
+            "median_fat_fraction_%": float(np.median(sat_ff)),
+            "std_fat_fraction_%": float(np.std(sat_ff)),
+            "min_fat_fraction_%": float(np.min(sat_ff)),
+            "max_fat_fraction_%": float(np.max(sat_ff)),
+            "p10_fat_fraction_%": float(np.percentile(sat_ff, 10)),
+            "p90_fat_fraction_%": float(np.percentile(sat_ff, 90)),
+        }
+    
+    # VAT / Inner Fat (label 67)
+    vat_mask = (seg_arr == 67)
+    vat_voxels = int(vat_mask.sum())
+    vat_volume_ml = (vat_voxels * voxel_volume_mm3) / 1000.0
+    
+    if vat_voxels > 0:
+        vat_water = water_arr[vat_mask]
+        vat_fat = fat_arr[vat_mask]
+        vat_total = vat_water + vat_fat
+        vat_valid = vat_total > 0
+        vat_ff = np.zeros_like(vat_fat)
+        vat_ff[vat_valid] = (vat_fat[vat_valid] / vat_total[vat_valid]) * 100.0
+        
+        fat_metrics["VAT"] = {
+            "label_id": 67,
+            "label_name": "inner_fat",
+            "voxel_count": vat_voxels,
+            "volume_mm3": vat_volume_ml * 1000.0,
+            "volume_ml": vat_volume_ml,
+            "mean_fat_fraction_%": float(np.mean(vat_ff)),
+            "median_fat_fraction_%": float(np.median(vat_ff)),
+            "std_fat_fraction_%": float(np.std(vat_ff)),
+            "min_fat_fraction_%": float(np.min(vat_ff)),
+            "max_fat_fraction_%": float(np.max(vat_ff)),
+            "p10_fat_fraction_%": float(np.percentile(vat_ff, 10)),
+            "p90_fat_fraction_%": float(np.percentile(vat_ff, 90)),
+        }
+    
+    # Total fat (SAT + VAT)
+    total_fat_volume_ml = sat_volume_ml + vat_volume_ml
+    fat_metrics["Total_Fat"] = {
+        "label_id": "65+67",
+        "label_name": "total_fat_SAT_plus_VAT",
+        "voxel_count": sat_voxels + vat_voxels,
+        "volume_mm3": total_fat_volume_ml * 1000.0,
+        "volume_ml": total_fat_volume_ml,
+    }
+    
+    return fat_metrics
+
+
+def write_muscle_volumes_csv(volumes_dict: Dict[int, Dict], out_csv_path: str) -> None:
+    """Write muscle volumes to CSV."""
+    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
+    
+    lines = ["label_id,label_name,voxel_count,voxel_volume_mm3,volume_mm3,volume_ml"]
+    for label_id in sorted(volumes_dict.keys()):
+        row = volumes_dict[label_id]
+        lines.append(
+            f"{row['label_id']},{row['label_name']},{row['voxel_count']},"
+            f"{row['voxel_volume_mm3']},{row['volume_mm3']},{row['volume_ml']}"
+        )
+    
+    with open(out_csv_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def write_muscle_fat_fraction_csv(fat_fraction_dict: Dict[int, Dict], out_csv_path: str) -> None:
+    """Write muscle fat fraction statistics to CSV."""
+    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
+    
+    lines = ["label_id,label_name,num_voxels,mean_ff_%,median_ff_%,std_ff_%,p10_ff_%,p90_ff_%"]
+    for label_id in sorted(fat_fraction_dict.keys()):
+        row = fat_fraction_dict[label_id]
+        lines.append(
+            f"{row['label_id']},{row['label_name']},{row['num_voxels']},"
+            f"{row['mean_ff_%']},{row['median_ff_%']},{row['std_ff_%']},"
+            f"{row['p10_ff_%']},{row['p90_ff_%']}"
+        )
+    
+    with open(out_csv_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def write_fat_metrics_csv(fat_metrics: Dict[str, Dict], out_csv_path: str) -> None:
+    """Write detailed fat metrics to CSV."""
+    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
+    
+    # Write header
+    header = [
+        "label_id",
+        "label_name",
+        "voxel_count",
+        "volume_mm3",
+        "volume_ml",
+        "mean_fat_fraction_%",
+        "median_fat_fraction_%",
+        "std_fat_fraction_%",
+        "min_fat_fraction_%",
+        "max_fat_fraction_%",
+        "p10_fat_fraction_%",
+        "p90_fat_fraction_%",
+    ]
+    lines = [",".join(header)]
+    
+    for key in ["SAT", "VAT", "Total_Fat"]:
+        if key in fat_metrics:
+            row = fat_metrics[key]
+            # Handle Total_Fat which may not have all fat fraction fields
+            if "mean_fat_fraction_%" in row:
+                lines.append(
+                    f"{row['label_id']},{row['label_name']},{row['voxel_count']},"
+                    f"{row['volume_mm3']},{row['volume_ml']},"
+                    f"{row['mean_fat_fraction_%']},{row['median_fat_fraction_%']},"
+                    f"{row['std_fat_fraction_%']},{row['min_fat_fraction_%']},"
+                    f"{row['max_fat_fraction_%']},{row['p10_fat_fraction_%']},"
+                    f"{row['p90_fat_fraction_%']}"
+                )
+            else:
+                # Total_Fat doesn't have fat fraction stats
+                lines.append(
+                    f"{row['label_id']},{row['label_name']},{row['voxel_count']},"
+                    f"{row['volume_mm3']},{row['volume_ml']},,,,,,"
+                )
+    
+    with open(out_csv_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Segment Dixon water/fat images with VIBESegmentator and compute detailed muscle volumes, fat fractions, and fat metrics."
+    )
+    parser.add_argument("--water", required=True, help="Path to Dixon water image (NIfTI)")
+    parser.add_argument("--fat", required=True, help="Path to Dixon fat image (NIfTI)")
+    parser.add_argument("--out_dir", required=True, help="Output directory for segmentation and quantification files")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps"], help="Device for inference")
+    parser.add_argument("--dataset_id", type=int, default=100, help="VIBESegmentator dataset id (default 100)")
+    parser.add_argument("--override", action="store_true", help="Override existing segmentation")
+    args = parser.parse_args()
+    
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    os.makedirs(args.out_dir, exist_ok=True)
+    
+    seg_path = os.path.join(args.out_dir, "segmentation.nii.gz")
+    muscle_volumes_csv = os.path.join(args.out_dir, "muscle_volumes.csv")
+    muscle_fat_fraction_csv = os.path.join(args.out_dir, "muscle_fat_fraction_percent.csv")
+    fat_metrics_csv = os.path.join(args.out_dir, "fat_metrics_detailed.csv")
+    
+    # 1) Run segmentation (use water image for segmentation)
+    if not os.path.exists(seg_path) or args.override:
+        print("Running VIBESegmentator...")
+        run_vibe_segmentator(args.water, seg_path, args.device, args.dataset_id, project_root)
+    else:
+        print(f"Segmentation already exists: {seg_path}")
+    
+    # 2) Compute muscle volumes and fat fractions
+    print("Computing muscle volumes and fat fractions...")
+    volumes_dict, fat_fraction_dict = compute_muscle_volumes_and_fat_fraction(seg_path, args.water, args.fat)
+    write_muscle_volumes_csv(volumes_dict, muscle_volumes_csv)
+    write_muscle_fat_fraction_csv(fat_fraction_dict, muscle_fat_fraction_csv)
+    
+    # 3) Compute detailed fat metrics
+    print("Computing detailed fat metrics...")
+    fat_metrics = compute_fat_metrics(seg_path, args.water, args.fat)
+    write_fat_metrics_csv(fat_metrics, fat_metrics_csv)
+    
+    # 4) Compute volumes for ALL labels (complete whole-body report)
+    print("Computing volumes for all labels...")
+    all_labels_csv = os.path.join(args.out_dir, "all_labels_volumes.csv")
+    try:
+        from compute_all_labels_volumes import compute_all_label_volumes
+        compute_all_label_volumes(seg_path, all_labels_csv)
+    except ImportError:
+        # If module not found, try direct import
+        import sys
+        tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        try:
+            from compute_all_labels_volumes import compute_all_label_volumes
+            compute_all_label_volumes(seg_path, all_labels_csv)
+        except Exception as e:
+            print(f"  WARNING: Could not compute all labels volumes: {e}")
+            print("  (This is optional - segmentation file contains all labels)")
+    
+    # 5) Generate comprehensive whole-body report
+    print("Generating comprehensive whole-body report...")
+    comprehensive_csv = os.path.join(args.out_dir, "comprehensive_whole_body_report.csv")
+    try:
+        from generate_comprehensive_report import generate_comprehensive_report
+        generate_comprehensive_report(args.out_dir, comprehensive_csv)
+    except ImportError:
+        # If module not found, try direct import
+        import sys
+        tools_dir = os.path.dirname(os.path.abspath(__file__))
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        try:
+            from generate_comprehensive_report import generate_comprehensive_report
+            generate_comprehensive_report(args.out_dir, comprehensive_csv)
+        except Exception as e:
+            print(f"  WARNING: Could not generate comprehensive report: {e}")
+    
+    print("\nDone. Outputs:")
+    print(f"  Segmentation: {seg_path}")
+    print(f"  Comprehensive report: {comprehensive_csv}")
+    print(f"  All label volumes: {all_labels_csv}")
+    print(f"  Muscle volumes: {muscle_volumes_csv}")
+    print(f"  Muscle fat fractions: {muscle_fat_fraction_csv}")
+    print(f"  Fat metrics: {fat_metrics_csv}")
+
+
+if __name__ == "__main__":
+    main()
+
